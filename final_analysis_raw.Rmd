@@ -1,0 +1,926 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+# Setup
+
+## Libraries
+
+```{r}
+quiet <- suppressPackageStartupMessages
+quiet(library(tidyverse))
+quiet(library(janitor))
+quiet(library(limma))
+quiet(library(openxlsx))
+# quiet(library(NormalyzerDE))
+R.utils::sourceDirectory("~/src/NormalyzerDE/R/")
+source("~/src/NormalyzerDE/R/utils.R")
+quiet(library(ProteinRollup))
+quiet(library(ggpubr))
+quiet(library(furrr))
+quiet(library(edgeR))
+
+plan(multisession)
+theme_set(theme_classic())
+```
+
+## Utility functions
+
+```{r}
+setup_contrast_object <- function(name, base, levels, formula_string) {
+  my_contrasts <- list(levels)
+  names(my_contrasts) <- c(name)
+  model <- as.formula(formula_string)
+  
+  my_contrasts_parsed <- lapply(my_contrasts, function(contrast) {
+    paste(paste0(base, contrast), collapse="-")
+  }) %>% unlist()
+  
+  list(
+    name=name,
+    model=model,
+    contrasts=my_contrasts_parsed,
+    group_col=base
+  )
+}
+
+calculate_limma_results <- function(rdf, ddf, sample_names, contrast_objs) {
+    
+    calculate_limma_contrast <- function(stat_obj, sdf, ddf) {
+        
+        model <- as.formula(stat_obj$model)
+        model_design <- model.matrix(model, data=ddf)
+        fit <- limma::lmFit(sdf, model_design)
+        contrasts <- stat_obj$contrasts
+        contrast.matrix <- limma::makeContrasts(contrasts=contrasts, levels=model_design)
+        fit_contrasts <- contrasts.fit(fit, contrast.matrix)
+        fit_bayes <- limma::eBayes(fit_contrasts)
+        limma_tables <- lapply(
+            seq_len(length(colnames(fit_bayes$coefficients))),
+                function(coef) { topTable(fit_bayes, coef=coef, number=Inf, sort.by="none", confint = TRUE) }
+        )
+        names(limma_tables) <- names(contrasts)
+        combined_limma_tables <- do.call("cbind", limma_tables)
+        combined_limma_tables
+    }
+    
+    sdm <- rdf %>% dplyr::select(all_of(sample_names)) %>% as.matrix()
+    adf <- rdf %>% dplyr::select(-any_of(sample_names))
+    stat_results_table <- lapply(contrast_objs, calculate_limma_contrast, sdf=sdm, ddf=ddf) %>% do.call("cbind", .) 
+    rdf_stat <- cbind(adf, stat_results_table, sdm)
+    rdf_stat
+}
+
+# Put this one in NormalyzerDE?
+calculate_normalyzerde_stats <- function(rdf, ddf, samples, contrasts, cond_col, covariate=NULL, least_rep_count=1) {
+  se <- SummarizedExperiment::SummarizedExperiment(
+    assay = rdf %>% dplyr::select(all_of(samples)) %>% as.matrix(),
+    rowData = rdf %>% dplyr::select(-one_of(samples)),
+    colData = ddf
+  )
+  nst <- NormalyzerStatistics(se, logTrans=FALSE)
+  nst_w_contrasts <- calculateContrasts(
+    nst, 
+    contrasts, 
+    condCol=cond_col, 
+    batchCol = covariate,
+    leastRepCount = least_rep_count)
+  
+  generateAnnotatedMatrix(
+    nst_w_contrasts, 
+    prefixSep=".", 
+    compLabels=names(contrasts)
+  )
+}
+```
+
+# Multiomics dataset
+
+Prior processing of datasets:
+
+* Proteomics: Global proteomics data, median polishing and log2 transformed, no missing value filtering
+* RNA-seq: Linear gene expression RSEM, upper quantile normalized and log2(+1) transformed
+
+## Load data
+
+### File paths
+
+```{r}
+uniprot_human_fp <- "input_data/dbs/homo_sapiens_uniprot.tab.gz"
+mo_proteomics_fp <- "input_data/2_multiomics/proteomics_rdf.tsv.gz"
+mo_rna_fp <- "input_data/2_multiomics/rna_rdf.tsv.gz"
+mo_ddf_fp <- "input_data/2_multiomics/mmc1.tsv"
+```
+
+### Databases
+
+```{r}
+uniprot_annot_df <- read_tsv(uniprot_human_fp) %>% janitor::clean_names()
+uniprot_annot_df %>% colnames()
+```
+
+### Data loading
+
+```{r}
+moo <- list()
+moo$rdf_prot <- read_tsv(mo_proteomics_fp)
+moo$rdf_rna <- read_tsv(mo_rna_fp, na="0")
+
+moo_joint_colnames <- intersect(colnames(moo$rdf_prot), colnames(moo$rdf_rna))
+
+moo$ddf_raw <- read_tsv(mo_ddf_fp) %>% 
+    filter(idx %in% moo_joint_colnames)
+moo$ddf <- moo$ddf_raw %>% 
+    dplyr::filter(Case_excluded == "No") %>% 
+    dplyr::filter(Proteomics_Tumor_Normal != "Adjacent_normal") %>%
+    dplyr::mutate(Genomics_subtype = Genomics_subtype %>% gsub("-", "_", .) %>% tolower()) %>%
+    dplyr::select(idx, Genomics_subtype, everything())
+
+moo$samples_raw <- moo$ddf_raw$idx
+moo$samples <- moo$ddf$idx
+```
+
+Check of numbers in each category - matches manuscript notes.
+
+```{r}
+moo$ddf$Genomics_subtype %>% table()
+```
+
+
+## Analysis
+
+### Distribution check
+
+```{r}
+ggarrange(
+  moo$rdf_prot %>% dplyr::select(moo$samples) %>% pivot_longer(everything()) %>% 
+      ggplot(aes(x=value)) + geom_histogram(bins=100, na.rm = TRUE) + ggtitle("Proteomics"),
+  moo$rdf_rna %>% dplyr::select(moo$samples) %>% pivot_longer(everything()) %>% 
+      ggplot(aes(x=value)) + geom_histogram(bins=100, na.rm = TRUE) + ggtitle("Transcriptomics"),
+  nrow=2
+)
+```
+
+### RNA-seq calculations
+
+* Untransform log-transformed values (and minus-shift one)
+* Filter low counts-per-million reads
+* Calculate Voom for the now approximate
+
+```{r}
+unlog <- function(mat) {
+    (2^mat)-1
+}
+
+rnaseqMatrix <- moo$rdf_rna %>% dplyr::select(moo$samples) %>% as.matrix() %>% unlog()
+rnaseqMatrix %>% data.frame() %>% pivot_longer(everything()) %>% ggplot(aes(x=value)) + geom_histogram(bins=100) + xlim(1, NA) + ylim(0, 1500)
+
+# Filter lowly abundant rows
+features_passing_cpm <- rowSums(edgeR::cpm(rnaseqMatrix %>% as.matrix() %>% replace_na(0)) >= 1) >= 6
+cpm_filtered_matrix <- rnaseqMatrix[features_passing_cpm, ]
+message(sprintf("Filtered %s perc of features", 100 * (1 - dim(cpm_filtered_matrix)[1] / dim(rnaseqMatrix)[1]) %>% round(4)))
+
+# Create EdgeR DGEList object, replacing NAs with zeroes
+DGE <- edgeR::DGEList(cpm_filtered_matrix %>% as.matrix() %>% replace_na(0))
+# Calculate TMM normalization factors for counts
+DGE <- edgeR::calcNormFactors(DGE, method = c("TMM"))
+
+# Calculate Voom and Limma 
+design_temp <- model.matrix(~0+Genomics_subtype, data=moo$ddf %>% as.matrix() %>% replace_na("missing") %>% data.frame())
+vwts <- voomWithQualityWeights(DGE, design=design_temp, normalize.method="none", plot=TRUE)
+
+# Check the distribution
+vwts$E %>% data.frame() %>% pivot_longer(everything()) %>% ggplot(aes(x=value)) + geom_histogram(bins=100)
+
+# Calculate Limma
+fit <- lmFit(vwts, design_temp)
+contr <- makeContrasts(Genomics_subtypecnv_high-Genomics_subtypecnv_low, levels=colnames(coef(fit)))
+contrast_fit <- contrasts.fit(fit, contr)
+efit <- eBayes(contrast_fit, robust=TRUE)
+
+# Retrieve toplist
+moo_rna_stat_adf <- topTable(efit, adjust="BH", coef="Genomics_subtypecnv_high - Genomics_subtypecnv_low", number=Inf, sort.by = "none") %>%
+    `colnames<-`(paste0("cnvhigh_cnvlow.", colnames(.)))
+moo_rna_stat_adf %>% filter(cnvhigh_cnvlow.adj.P.Val < 0.05 & abs(cnvhigh_cnvlow.logFC) > 1)
+
+moo_rna_stat_adf %>% ggplot(aes(x=cnvhigh_cnvlow.P.Value)) + geom_histogram(bins=100)
+
+# moo_rna_stat_adf <- moo_rna_stat_adf %>% `colnames<-`(paste0("cnvhigh_cnvlow.", colnames(moo_rna_stat_adf)))
+moo$rdf_rna_w_stats <- cbind(idx=moo$rdf_rna$idx[features_passing_cpm], moo_rna_stat_adf, moo$rdf_rna[features_passing_cpm, ] %>% dplyr::select(moo$ddf$idx))
+```
+
+### Spotcheck regulated feature
+
+```{r}
+moo$rdf_rna %>% 
+  filter(idx=="WDR53") %>% 
+  dplyr::select(all_of(moo$ddf$idx)) %>% 
+  t() %>% 
+  data.frame() %>% 
+  rownames_to_column("sample_name") %>% 
+  `colnames<-`(c("idx", "value")) %>% 
+  left_join(moo$ddf, by="idx") %>% 
+  ggplot(aes(x=.$Genomics_subtype, .$value)) + geom_boxplot() + geom_jitter(width=0.1)
+
+moo$rdf_rna_w_stats %>% 
+  filter(idx=="SENP5") %>% 
+  dplyr::select(all_of(moo$ddf$idx)) %>% 
+  t() %>%
+  data.frame() %>% 
+  rownames_to_column("sample_name") %>% 
+  `colnames<-`(c("idx", "value")) %>% 
+  left_join(moo$ddf, by="idx") %>% 
+  ggplot(aes(x=.$Genomics_subtype, .$value)) + geom_boxplot() + geom_jitter(width=0.1)
+```
+
+### Proteomics statistics
+
+Already log transformed.
+
+```{r}
+moo$prot_rdf_stat <- calculate_normalyzerde_stats(
+  moo$rdf_prot %>% dplyr::select(idx, all_of(moo$ddf$idx)), 
+  moo$ddf, 
+  moo$ddf$idx, 
+  c("cnv_high_low"="cnv_high-cnv_low"), 
+  cond_col="Genomics_subtype"
+)
+
+qplot(moo$prot_rdf_stat$cnv_high_low.PValue, bins=100, na.rm=TRUE) + xlab("P-value") + ylab("Count") + ggtitle("Proteomics p-value distribution")
+```
+
+## Output
+
+```{r}
+moo_out_base <- "output_data/multiomics"
+
+dir.create(moo_out_base, recursive = TRUE)
+write_tsv(moo$rdf_prot, path=sprintf("%s/prot_full.tsv", moo_out_base))
+write_tsv(moo$prot_rdf_stat, path=sprintf("%s/prot_stats.tsv", moo_out_base))
+write_tsv(moo$prot_rdf_stat %>% head(500), path=sprintf("%s/prot_stats_500.tsv", moo_out_base))
+
+write_tsv(moo$rdf_rna, path=sprintf("%s/rna_full.tsv", moo_out_base))
+write_tsv(moo$rdf_rna_w_stats, path=sprintf("%s/rna_stats.tsv", moo_out_base))
+write_tsv(moo$rdf_rna_w_stats %>% head(500), path=sprintf("%s/rna_stats_500.tsv", moo_out_base))
+
+write_tsv(moo$ddf_raw %>% dplyr::select(idx, Genomics_subtype, everything()), path=sprintf("%s/design_full.tsv", moo_out_base))
+write_tsv(moo$ddf %>% dplyr::select(idx, Genomics_subtype, everything()), path=sprintf("%s/design_stats.tsv", moo_out_base))
+```
+
+# Covid dataset: Proteomics
+
+## Load data
+
+### File paths
+
+```{r}
+coo_proteomics_fp <- "input_data/3_covid/supplementary_table_02_prot.tsv"
+coo_translatomics_fp <- "input_data/3_covid/supplementary_table_01_transl.tsv"
+coo_ddf_fp <- "input_data/3_covid/covid_ddf.tsv"
+virus_prots_fp <- "input_data/dbs/virus_ids_only.txt"
+virus_prots_w_receptors <- "input_data/dbs/virus_related_ids.txt"
+```
+
+### Databases
+
+```{r}
+virus_ids <- read_tsv(virus_prots_fp, col_names = FALSE) %>% unlist() %>% unname()
+virus_and_host_ids <- read_tsv(virus_prots_w_receptors, col_names = FALSE) %>% unlist() %>% unname()
+
+message("Virus proteins")
+message(paste(virus_ids, collapse=", "))
+message("Virus proteins and receptors")
+message(paste(virus_and_host_ids, collapse=", "))
+```
+
+### Data loading
+
+```{r}
+coo <- list()
+coo$rdf_prot <- read_tsv(coo_proteomics_fp, na = "0") %>%
+    left_join(uniprot_annot_df %>% dplyr::select(entry, protein_names), by=c("UniProt.Accession"="entry")) %>% 
+    dplyr::select(UniProt.Accession, protein_names, everything())
+
+coo$rdf_transl <- read_tsv(coo_translatomics_fp) %>%
+    `colnames<-`(colnames(.) %>% make.names()) %>%
+    left_join(uniprot_annot_df %>% dplyr::select(entry, protein_names), by=c("Accession"="entry")) %>%
+    dplyr::select(Accession, protein_names, everything())
+
+coo$ddf <- read_tsv(coo_ddf_fp)
+coo$samples <- coo$ddf$sample
+
+coo$rdf_prot$VirusType <- ifelse(coo$rdf_prot$UniProt.Accession %in% virus_and_host_ids, ifelse(coo$rdf_prot$UniProt.Accession %in% virus_ids, "virus", "virus_host"), "na")
+coo$rdf_transl$VirusType <- ifelse(coo$rdf_transl$Accession %in% virus_and_host_ids, ifelse(coo$rdf_transl$Accession %in% virus_ids, "virus", "virus_host"), "na")
+```
+
+## Analysis
+
+### Distribution check
+
+Distribution after log transform
+
+```{r}
+ggarrange(
+    coo$rdf_prot %>% 
+        dplyr::select(coo$samples) %>% 
+        log2() %>%
+        pivot_longer(everything()) %>% 
+        ggplot(aes(x=value)) + geom_histogram(bins=100, na.rm = TRUE) + ggtitle("Covid proteomics"),
+    coo$rdf_transl %>%
+        dplyr::select(coo$samples) %>%
+        log2() %>%
+        # mutate_all(~.+10) %>%
+        pivot_longer(everything()) %>%
+        ggplot(aes(x=value)) + geom_histogram(bins=100, na.rm = TRUE) + ggtitle("Covid translatomics")
+) %>% annotate_figure(top="Log2 transformed")
+
+ggarrange(
+  coo$rdf_prot %>% 
+      dplyr::select(coo$samples) %>% 
+      log2() %>% 
+      pivot_longer(everything(), names_to="sample") %>% 
+      inner_join(coo$ddf, "sample") %>%
+      ggplot(aes(x=value, color=combined)) + geom_density() + ggtitle("Covid proteomics"),
+  coo$rdf_transl %>% 
+      dplyr::select(coo$samples) %>% 
+      log2() %>% 
+      pivot_longer(everything(), names_to="sample") %>% 
+      inner_join(coo$ddf, "sample") %>%
+      ggplot(aes(x=value, color=combined)) + geom_density() + ggtitle("Covid translatomics"), common.legend = TRUE
+)
+```
+
+### Normalization
+
+A simple log2 transform seems to suffice.
+
+```{r}
+coo$sdm_prot <- coo$rdf_prot %>% dplyr::select(coo$samples) %>% as.matrix() %>% log2()
+coo$rdf_prot_norm <- cbind(
+  coo$rdf_prot %>% dplyr::select(-any_of(coo$ddf$sample)),
+  coo$sdm
+)
+
+coo$sdm_transl <- coo$rdf_transl %>% dplyr::select(coo$samples) %>% as.matrix() %>% log2()
+coo$rdf_transl_norm <- cbind(
+  coo$rdf_transl %>% dplyr::select(-any_of(coo$ddf$sample)),
+  coo$sdm_transl
+)
+```
+
+### Statistical contrasts (Limma)
+
+Prepare contrasts
+
+```{r}
+covid_contrasts <- c(
+  "inf_ctl_2h"="infected_2h-control_2h",
+  "inf_ctl_6h"="infected_6h-control_6h",
+  "inf_ctl_10h"="infected_10h-control_10h",
+  "inf_ctl_24h"="infected_24h-control_24h",
+  "inf_6h_2h"="infected_6h-infected_2h",
+  "inf_10h_2h"="infected_10h-infected_2h",
+  "inf_24h_2h"="infected_24h-infected_2h",
+  "ctl_6h_2h"="control_6h-control_2h",
+  "ctl_10h_2h"="control_10h-control_2h",
+  "ctl_24h_2h"="control_24h-control_2h"
+)
+covid_contrasts_w_cov <- covid_contrasts %>% `names<-`(names(covid_contrasts) %>% paste0(., "_wcov"))
+```
+
+Perform calculations
+
+```{r}
+coo$prot_rdf_stat_nocov <- calculate_normalyzerde_stats(coo$rdf_prot_norm, coo$ddf, coo$samples, covid_contrasts, cond_col="combined")
+coo$prot_rdf_stat_cov <- calculate_normalyzerde_stats(coo$rdf_prot_norm, coo$ddf, coo$samples, covid_contrasts_w_cov, cond_col="combined", covariate="nbr")
+prot_cov_spec_cols <- colnames(coo$prot_rdf_stat_cov)[!(colnames(coo$prot_rdf_stat_cov) %in% colnames(coo$prot_rdf_stat_nocov))]
+coo$prot_rdf_stat <- cbind(
+  coo$prot_rdf_stat_nocov,
+  coo$prot_rdf_stat_cov %>% dplyr::select(all_of(prot_cov_spec_cols))
+)
+
+coo$transl_rdf_stat_nocov <- calculate_normalyzerde_stats(coo$rdf_transl_norm, coo$ddf, coo$samples, covid_contrasts, cond_col="combined")
+coo$transl_rdf_stat_cov <- calculate_normalyzerde_stats(coo$rdf_transl_norm, coo$ddf, coo$samples, covid_contrasts_w_cov, cond_col="combined", covariate="nbr")
+transl_cov_spec_cols <- colnames(coo$prot_rdf_stat_cov)[!(colnames(coo$prot_rdf_stat_cov) %in% colnames(coo$prot_rdf_stat_nocov))]
+coo$transl_rdf_stat <- cbind(
+  coo$transl_rdf_stat_nocov,
+  coo$transl_rdf_stat_cov %>% dplyr::select(all_of(transl_cov_spec_cols))
+)
+```
+
+## Output
+
+```{r}
+coo_basedir <- "output_data/covid"
+dir.create("output_data/covid", recursive = TRUE)
+write_tsv(coo$prot_rdf_stat, path=sprintf("%s/data_prot.tsv", coo_basedir))
+write_tsv(coo$transl_rdf_stat, path=sprintf("%s/data_transl.tsv", coo_basedir))
+write_tsv(coo$ddf, path=sprintf("%s/design_prot.tsv", coo_basedir))
+```
+
+# Covid dataset: RNA-seq
+
+
+(Previously)
+Based on article: SARS-CoV-2 productively infects human gut enterocytes (Mart M Lamers, Science, 2020)
+Supplementary materials retrieved from:
+https://science.sciencemag.org/content/suppl/2020/04/30/science.abc1669.DC1
+
+(Now)
+Based on supplementary retrieved from: https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE149312
+From info: `Supplementary_files_format_and_content: The data are in csv format. The table contains UMI deduplicated counts normalized between samples.`
+
+* UMI (unique molecular identifier) count: Absolute number of observed transcripts, alternative to read counting? Negative binomial good fit?
+
+## Process expression data
+
+```{r}
+sarscov2_ddf <- read_tsv("input_data/3_covid_2/covid_expression_ddf.tsv")
+sarscov2_rdf <- read_csv("input_data/3_covid_2/GSE149312_corona_intestine_exp1_ndata.csv")
+
+head(sarscov2_ddf)
+head(sarscov2_rdf)
+
+sarscov2_rdf %>% pivot_longer(-1) %>% mutate(value=log2(value)) %>% ggplot(aes(x=value, color=name)) + geom_density()
+
+sc2_rnaseq_matrix <- sarscov2_rdf %>% dplyr::select(-1) %>% as.matrix()
+sc2_rnaseq_matrix %>% data.frame() %>% pivot_longer(everything()) %>% ggplot(aes(x=value)) + geom_histogram(bins=100) + xlim(0.1, NA) + ylim(0, 2000)
+
+# Create EdgeR DGEList object, replacing NAs with zeroes
+sc2_DGE <- edgeR::DGEList(sc2_rnaseq_matrix %>% as.matrix())
+# Calculate TMM normalization factors for counts
+sc2_DGE <- edgeR::calcNormFactors(sc2_DGE, method = c("TMM"))
+
+# Calculate Voom and Limma 
+sc2_design_temp <- model.matrix(~0+medium_type_time, data=sarscov2_ddf %>% as.matrix() %>% replace_na("missing") %>% data.frame())
+sc2_vwts <- voomWithQualityWeights(sc2_DGE, design=sc2_design_temp, normalize.method="none", plot=TRUE)
+sc2_vwts$E %>% data.frame() %>% pivot_longer(everything()) %>% ggplot(aes(x=value)) + geom_histogram(bins=100)
+
+# Perform Limma calculations
+sc2_fit <- lmFit(sc2_vwts, sc2_design_temp)
+
+do_limma_contrast <- function(contr, linear_fit, coef, base_name, show_outcome=TRUE) {
+  # Retrieve toplist diff medium
+  # contr <- makeContrasts(contrast, levels=colnames(coef(sc2_fit)))
+  contrast_fit <- contrasts.fit(linear_fit, contr)
+  ebayes_contrast_fit <- eBayes(contrast_fit, robust=TRUE)
+  
+  stat_adf <- topTable(
+    ebayes_contrast_fit, 
+    adjust="BH", 
+    coef=coef, 
+    number=Inf, sort.by = "none") %>%
+      `colnames<-`(paste0(base_name, ".", colnames(.)))
+  
+  if (show_outcome) {
+    print(stat_adf %>% filter(UQ(as.name(sprintf("%s.adj.P.Val", base_name))) < 0.05 & abs(UQ(as.name(sprintf("%s.logFC", base_name)))) > 1))
+    print(stat_adf %>% ggplot(aes(x=UQ(as.name(sprintf("%s.P.Value", base_name))))) + geom_histogram(bins=100))
+  }
+  
+  stat_adf
+}
+
+diff_med_24h_sadf <- do_limma_contrast(
+  makeContrasts(
+    medium_type_timedifferentiation_sarscov2_24h-medium_type_timedifferentiation_control_NA, 
+    levels=colnames(coef(sc2_fit))
+  ),
+  sc2_fit,
+  "medium_type_timedifferentiation_sarscov2_24h - medium_type_timedifferentiation_control_NA",
+  "diff_med_24h"
+)
+
+exp_med_24h_sadf <- do_limma_contrast(
+  makeContrasts(
+    medium_type_timeexpansion_sarscov2_24h-medium_type_timeexpansion_control_NA, 
+    levels=colnames(coef(sc2_fit))
+  ),
+  sc2_fit,
+  "medium_type_timeexpansion_sarscov2_24h - medium_type_timeexpansion_control_NA",
+  "exp_med_24h"
+)
+
+diff_med_60h_sadf <- do_limma_contrast(
+  makeContrasts(
+    medium_type_timedifferentiation_sarscov2_60h-medium_type_timedifferentiation_control_NA, 
+    levels=colnames(coef(sc2_fit))
+  ),
+  sc2_fit,
+  "medium_type_timedifferentiation_sarscov2_60h - medium_type_timedifferentiation_control_NA",
+  "diff_med_60h"
+)
+
+exp_med_60h_sadf <- do_limma_contrast(
+  makeContrasts(
+    medium_type_timeexpansion_sarscov2_60h-medium_type_timeexpansion_control_NA, 
+    levels=colnames(coef(sc2_fit))
+  ),
+  sc2_fit,
+  "medium_type_timeexpansion_sarscov2_60h - medium_type_timeexpansion_control_NA",
+  "exp_med_60h"
+)
+```
+## Load existing Limma comparisons (60h)
+
+```{r}
+parse_for_omicloupe <- function(raw_df, prefix) {
+  raw_df %>% 
+    janitor::clean_names() %>% 
+    rename(full_gene=x1, PValue=pvalue, AdjPVal=padj, log2FoldChange=log2fold_change, featureAvg=base_mean) %>% 
+    rename_at(vars(!matches("^full_gene$")), ~paste0(prefix, ".", .)) %>%
+    mutate(idx=gsub("__.*", "", full_gene), chr=gsub(".*__", "", full_gene)) %>% select(idx, chr, full_gene, everything())
+}
+
+sarscov2_rna_exp_organoids_df <- read_tsv("../../raw/200710_rna_covid/abc1669-Lamers-Table-S2.tsv") %>%
+  parse_for_omicloupe("exp_med_60h_precalc")
+sarscov2_rna_diff_organoids_df <- read_tsv("../../raw/200710_rna_covid/abc1669-Lamers-Table-S3.tsv") %>% 
+  parse_for_omicloupe("diff_org_60h_precalc")
+
+```
+
+
+## Setup results table
+
+```{r}
+sc2_result_rdf <- cbind(
+  idx=sarscov2_rdf$Gene_chromosome %>% gsub("_.*", "", .),
+  diff_med_24h_sadf,
+  exp_med_24h_sadf,
+  diff_med_60h_sadf,
+  exp_med_60h_sadf,
+  sarscov2_rna_exp_organoids_df %>% dplyr::select(-one_of("idx", "chr", "full_gene")),
+  sarscov2_rna_diff_organoids_df %>% dplyr::select(-one_of("idx", "chr", "full_gene")),
+  sc2_vwts$E %>% replace_na(0)
+)
+
+sc2_result_rdf %>% ggplot(aes(x=exp_med_60h.logFC, y=exp_med_60h_precalc.log2FoldChange)) + geom_point() + ggtitle("RNA-seq 60h, my analysis vs theirs")
+sc2_result_rdf %>% ggplot(aes(x=exp_med_60h.logFC, y=exp_med_24h.logFC)) + geom_point() + ggtitle("RNA-seq 60h vs 24h folds (my analysis)")
+sc2_result_rdf %>% ggplot(aes(x=exp_med_60h.logFC-exp_med_60h_precalc.log2FoldChange)) + geom_histogram(bins=100)
+```
+
+## Output
+
+```{r}
+write_tsv(sc2_result_rdf, path = sprintf("%s/data_rna.tsv", coo_basedir))
+write_tsv(sarscov2_ddf, path = sprintf("%s/design_rna.tsv", coo_basedir))
+```
+
+# LFQ benchmark dataset
+
+## LFQ util functions
+
+```{r}
+classify_protein <- function(protein_labels) {
+  if (all(grepl("HUMAN$", protein_labels))) {
+    "human"
+  }
+  else if (all(grepl("YEAS8$", protein_labels))) {
+    "yeast"
+  }
+  else if (all(grepl("ECOLI$", protein_labels))) {
+    "ecoli"
+  }
+  else if (length(protein_labels) > 1) {
+    "ambiguous"
+  }
+  else {
+    "unknown"
+  }
+}
+
+classify_table <- function(rdf, target_col, annot_col) {
+  classifications <- rdf[[target_col]] %>%
+    lapply(function(raw_string, splitter=";") {
+      entries <- raw_string %>% str_split(";") %>% unlist()
+      entries <- entries[str_length(entries) > 0]
+      classify_protein(entries)
+    }) %>% unlist()
+  rdf %>% dplyr::mutate(class=classifications) %>% dplyr::select(class, everything())
+}
+
+clean_annot <- function(rdf, annot_col) {
+  annot_col <- enquo(annot_col)
+  rdf %>% 
+    dplyr::mutate(protein_clean=!!annot_col %>% gsub("1/", "", .) %>% gsub("(\\w)$", "\\1;", .)) %>%
+    dplyr::select(protein_clean, everything())
+}
+```
+
+## Load data
+
+### Filepaths
+
+```{r}
+dia_umpire_fp <- "input_data/1_lfq_workbench/DIAumpire_HYE110_TTOF6600_32fix_PeptideSummary_201604081809.tsv.gz"
+openswath_fp <- "input_data/1_lfq_workbench/OpenSWATH_HYE110_TTOF6600_32fixed_160308_feature_alignment.tsv.gz"
+peakview_fp <- "input_data/1_lfq_workbench/PeakView_HYE110_TTOF6600_32fixed_160308.xlsx"
+skyline_fp <- "input_data/1_lfq_workbench/Skyline_HYE110_TTOF6600_32fixed_160308.tsv.gz"
+spectronaut_fp <- "input_data/1_lfq_workbench/Spectronaut_HYE110_TTOF6600_32fixed_160308_Report.tsv.gz"
+```
+
+### Setup datasets objects and ddf
+
+```{r}
+lfq_objs <- list()
+lfq_objs$du <- list()
+lfq_objs$os <- list()
+lfq_objs$pv <- list()
+lfq_objs$sl <- list()
+lfq_objs$sn <- list()
+
+
+sample_names <- c(
+  "lgillet_i160308_001", "lgillet_i160308_003", "lgillet_i160308_010",
+  "lgillet_i160308_002", "lgillet_i160308_004", "lgillet_i160308_011"
+)
+
+ddf <- data.frame(sample=sample_names, group=c(rep("A", 3), rep("B", 3)), stringsAsFactors = FALSE)
+ddf
+```
+
+### DIA Umpire (du)
+
+```{r}
+lfq_objs$du$raw <- read_tsv(dia_umpire_fp) %>% janitor::clean_names()
+
+lfq_objs$du$rdf <- lfq_objs$du$raw %>% 
+  dplyr::select(
+    peptide=sequence, 
+    protein=proteins, 
+    mz=mz, 
+    charge=charge, 
+    all_of(paste(sample_names, "ms1", sep="_"))) %>%
+  rename_at(vars(matches("^lgillet")), ~gsub("_ms1$", "", .)) %>%
+  mutate_at(vars(matches("^lgillet")), ~na_if(., 0))
+
+lfq_objs$du$long <- lfq_objs$du$rdf %>% pivot_longer(matches("^lgillet"), names_to="source", values_to="value")
+```
+
+### OpenSWATH (os)
+
+```{r}
+lfq_objs$os$raw <- read_tsv(openswath_fp) %>% janitor::clean_names()
+
+lfq_objs$os$long <- lfq_objs$os$raw %>% 
+  dplyr::select(
+    peptide=peptide_group_label, 
+    protein=protein_name, 
+    mz=m_z, 
+    charge=charge, 
+    filename, 
+    value=intensity) %>%
+  dplyr::mutate(source=filename %>% gsub(".*/", "", .) %>% gsub("\\..*", "", .) %>% tolower()) %>% dplyr::select(-filename) %>% 
+  dplyr::select(peptide, protein, mz, charge, source, value)
+
+lfq_objs$os$rdf <- lfq_objs$os$long %>% pivot_wider(names_from = source, values_from = value)
+```
+
+### PeakView (pv)
+
+```{r}
+lfq_objs$pv$raw <- read.xlsx(peakview_fp) %>%
+  janitor::clean_names()
+
+lfq_objs$pv$rdf <- lfq_objs$pv$raw %>% 
+  dplyr::select(
+    peptide=peptide, 
+    protein=protein, 
+    mz=fragment_mz, 
+    charge=precursor_charge, 
+    matches("^pedro")) %>%
+  dplyr::rename_at(vars(matches("^pedro")), ~gsub(".*fixed_", "", .) %>% gsub("_wiff.*", "", .) %>% tolower())
+
+lfq_objs$pv$long <- lfq_objs$pv$rdf %>% 
+  pivot_longer(all_of(sample_names), names_to = "source", values_to = "value")
+```
+
+### Skyline (sl)
+
+```{r}
+lfq_objs$sl$raw <- read_tsv(skyline_fp, na="0")  %>% 
+  janitor::clean_names()
+
+lfq_objs$sl$long <- lfq_objs$sl$raw %>% 
+  dplyr::select(
+    peptide=peptide_modified_sequence, 
+    protein=protein_name, 
+    mz=precursor_neutral_mass/precursor_charge, 
+    charge=precursor_charge, 
+    source=replicate_name, 
+    value=total_area)
+
+lfq_objs$sl$rdf <- lfq_objs$sl$long %>% 
+  tidyr::pivot_wider(names_from="source", values_from="value") %>% 
+  rename_all(~tolower(.))
+
+```
+
+### Spectronaut (sn)
+
+```{r}
+lfq_objs$sn$raw <- read_tsv(spectronaut_fp, na=c("#N/A", "0")) %>% 
+  janitor::clean_names()
+
+lfq_objs$sn$long <- lfq_objs$sn$raw %>% 
+      dplyr::select(
+    peptide=eg_modified_sequence, 
+    protein=eg_protein_id, 
+    mz=fg_prec_mz, 
+    charge=fg_charge, 
+    source=r_file_name, 
+    value=fg_total_peak_area)
+
+lfq_objs$sn$rdf <- lfq_objs$sn$long %>% 
+  tidyr::pivot_wider(names_from = source, values_from = value) %>% 
+  rename_all(~tolower(.))
+```
+
+## Analysis
+
+### Check numbers
+
+```{r}
+walk(names(lfq_objs), ~message(., " row count: ", lfq_objs[[.]]$rdf %>% nrow()))
+message("---")
+walk(names(lfq_objs), ~message(., " unique prots: ", lfq_objs[[.]]$rdf$protein %>% unique() %>% length()))
+```
+
+
+### Check distributions
+
+```{r}
+sample_names <- c(
+  "lgillet_i160308_001", "lgillet_i160308_003", "lgillet_i160308_010",
+  "lgillet_i160308_002", "lgillet_i160308_004", "lgillet_i160308_011"
+)
+
+map(
+  names(lfq_objs), 
+  ~lfq_objs[[.]]$long %>% mutate(log2_val=log2(value)) %>% ggplot(aes(x=log2_val)) + geom_histogram(bins=100, na.rm=TRUE) + ggtitle(.)
+) %>% 
+  ggpubr::ggarrange(plotlist = ., nrow=3, ncol=2) %>% 
+  ggpubr::annotate_figure(top="Raw data")
+```
+
+### Perform normalizations
+
+```{r}
+make_normalized_rdf <- function(rdf, samples, transform_func) {
+  sdm <- rdf %>% dplyr::select(all_of(samples)) %>% as.matrix()
+  adf <- rdf %>% dplyr::select(-all_of(samples))
+  sdm_trans <- transform_func(sdm)
+  cbind(adf, sdm_trans)
+}
+
+lfq_objs <- map(lfq_objs, function(obj, samples) {
+  norm_rdf <- make_normalized_rdf(obj$rdf, samples, log2)
+  obj$rdf_norm <- norm_rdf
+  obj$long_norm <- obj$rdf_norm %>% 
+    pivot_longer(all_of(samples), names_to="source", values_to="value")
+  obj
+}, samples=ddf$sample)
+
+names(lfq_objs)
+```
+
+### Protein rollup
+
+```{r}
+lfq_objs <- future_map(lfq_objs, function(obj, samples) {
+    
+  print("Iteration")
+  prot_rdf <- ProteinRollup::protein_rollup(
+    obj$rdf_norm$protein, 
+    obj$rdf_norm %>% dplyr::select(samples) %>% as.matrix(), protein_col_name="protein")
+  
+  obj$prot_rdf <- prot_rdf %>%
+    classify_table("Protein", "class") %>%
+    clean_annot(Protein)
+  
+  obj$long_prot <- obj$prot_rdf %>% 
+    pivot_longer(all_of(samples), names_to="source", values_to="value")
+  
+  obj
+}, samples=ddf$sample)
+
+map(names(lfq_objs), ~message(., " prots: ", nrow(lfq_objs[[.]]$prot_rdf)))
+```
+
+### Visualize distributions of spike-in proteins
+
+```{r}
+map(
+  names(lfq_objs), 
+  ~lfq_objs[[.]]$long_prot %>% ggplot(aes(x=value, fill=class)) + geom_histogram(bins=100, na.rm=TRUE) + ggtitle(.)
+) %>% 
+  ggpubr::ggarrange(plotlist = ., nrow=3, ncol=2) %>% 
+  ggpubr::annotate_figure(top="Protein data")
+```
+
+
+
+
+### Perform statistical comparisons
+
+#### Functions for LFQ statistics
+
+```{r}
+setup_contrast_object <- function(name, base, levels, formula_string) {
+  my_contrasts <- list(levels)
+  names(my_contrasts) <- c(name)
+  model <- as.formula(formula_string)
+  
+  my_contrasts_parsed <- lapply(my_contrasts, function(contrast) {
+    paste(paste0(base, contrast), collapse="-")
+  }) %>% unlist()
+  
+  list(
+    name=name,
+    model=model,
+    contrasts=my_contrasts_parsed,
+    group_col=base
+  )
+}
+
+calculate_limma_contrast <- function(stat_obj, sdf, ddf) {
+  
+  model <- as.formula(stat_obj$model)
+  model_design <- model.matrix(model, data=ddf)
+  fit <- limma::lmFit(sdf, model_design)
+  contrasts <- stat_obj$contrasts
+  contrast.matrix <- limma::makeContrasts(contrasts=contrasts, levels=model_design)
+  fit_contrasts <- contrasts.fit(fit, contrast.matrix)
+  fit_bayes <- limma::eBayes(fit_contrasts)
+  limma_tables <- lapply(
+    seq_len(length(colnames(fit_bayes$coefficients))),
+    function(coef) { topTable(
+      fit_bayes, coef=coef, number=Inf, sort.by="none", confint = TRUE) }
+  )
+  names(limma_tables) <- names(contrasts)
+  combined_limma_tables <- do.call("cbind", limma_tables)
+  combined_limma_tables
+}
+```
+
+#### Statistical calculations
+
+```{r  fig.height=5,fig.width=10}
+stat_obj <- setup_contrast_object("comp", "group", c("B", "A"), "~0+group")
+
+lfq_objs <- map(lfq_objs, function(obj, samples) {
+  sdm <- obj$prot_rdf %>% dplyr::select(all_of(samples)) %>% as.matrix()
+  adf <- obj$prot_rdf %>% dplyr::select(-one_of(samples))
+  stat_adf <- calculate_limma_contrast(stat_obj, sdm, ddf=ddf)
+  obj$prot_stat_rdf <- cbind(adf, stat_adf, sdm)
+  obj
+}, samples=sample_names)
+
+map(names(lfq_objs), ~lfq_objs[[.]]$prot_stat_rdf %>% 
+      ggplot(aes(x=comp.P.Value, fill=class)) + geom_histogram(bins=100, na.rm = TRUE) + ggtitle(.)) %>%
+        ggpubr::ggarrange(plotlist=., ncol=2, nrow=3) %>% ggpubr::annotate_figure(., top="P-histograms")
+```
+
+### Setup joint five-way table (reduced)
+
+```{r}
+common_proteins <- Reduce(intersect, map(lfq_objs, ~.$prot_stat_rdf %>% pull(protein_clean)))
+joint_rdfs <- map(lfq_objs, ~.$prot_stat_rdf %>% filter(protein_clean %in% common_proteins) %>% arrange(protein_clean))
+joint_rdf_table <- joint_rdfs %>% do.call("cbind", .)
+joint_ddf <- map(names(lfq_objs), ~ddf %>% mutate(sample=paste(.x, sample, sep="."), source=.x)) %>% do.call("rbind", .)
+
+print(sprintf("Common proteins: %s", length(common_proteins)))
+```
+
+### Setup joint five-way table (all proteins)
+
+```{r}
+# map(names(lfq_objs), ~lfq_objs[[.]]$prot_stat_rdf %>% head() %>% rename_at(vars(!matches("protein_clean")), ~paste0(.x, ".", .)))
+joint_rdf_table_all <- map(names(lfq_objs), function(pattern) {
+  lfq_objs[[pattern]]$prot_stat_rdf %>% 
+    rename_at(vars(!matches("protein_clean")), ~paste0(pattern, ".", .))
+}) %>% Reduce(function(df1, df2) {
+  full_join(df1, df2, "protein_clean")
+}, .) %>%
+  classify_table("protein_clean", "class")
+```
+
+## Output
+
+```{r}
+lfq_base_out <- "output_data/lfq"
+dir.create(lfq_base_out, recursive = TRUE)
+
+write_tsv(ddf, sprintf("%s/design.tsv", lfq_base_out))
+walk(names(lfq_objs), ~write_tsv(lfq_objs[[.]]$prot_stat_rdf, path = sprintf("%s/%s_data.tsv", lfq_base_out, .)))
+write_tsv(joint_rdf_table, path=sprintf("%s/joint_data_reduced.tsv", lfq_base_out))
+write_tsv(joint_rdf_table_all, path=sprintf("%s/joint_data_full.tsv", lfq_base_out))
+write_tsv(joint_ddf, path=sprintf("%s/joint_design.tsv", lfq_base_out))
+```
+
+# Session info
+
+```{r}
+sessionInfo()
+```
+
