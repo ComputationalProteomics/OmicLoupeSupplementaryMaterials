@@ -1,3 +1,5 @@
+[![DOI](https://zenodo.org/badge/305715617.svg)](https://zenodo.org/badge/latestdoi/305715617)
+
 # Supplementary materials for OmicLoupe manuscript
 
 Code- and settings-based documents. This contains:
