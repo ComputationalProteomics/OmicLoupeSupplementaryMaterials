@@ -1,6 +1,8 @@
 ---
 title: "R Notebook"
-output: html_notebook
+output:
+  html_document:
+    df_print: paged
 ---
 
 # Setup
@@ -13,9 +15,7 @@ quiet(library(tidyverse))
 quiet(library(janitor))
 quiet(library(limma))
 quiet(library(openxlsx))
-# quiet(library(NormalyzerDE))
-R.utils::sourceDirectory("~/src/NormalyzerDE/R/")
-source("~/src/NormalyzerDE/R/utils.R")
+quiet(library(NormalyzerDE))
 quiet(library(ProteinRollup))
 quiet(library(ggpubr))
 quiet(library(furrr))
@@ -72,7 +72,6 @@ calculate_limma_results <- function(rdf, ddf, sample_names, contrast_objs) {
     rdf_stat
 }
 
-# Put this one in NormalyzerDE?
 calculate_normalyzerde_stats <- function(rdf, ddf, samples, contrasts, cond_col, covariate=NULL, least_rep_count=1) {
   se <- SummarizedExperiment::SummarizedExperiment(
     assay = rdf %>% dplyr::select(all_of(samples)) %>% as.matrix(),
@@ -97,7 +96,11 @@ calculate_normalyzerde_stats <- function(rdf, ddf, samples, contrasts, cond_col,
 
 # Multiomics dataset
 
-Prior processing of datasets:
+Based on the study "Proteogenomic Characterization of Endometrial Carcinoma" (doi: https://doi.org/10.1016/j.cell.2020.01.026).
+
+The data is retrieved from the supplementary materials in this article. The database with human proteins is retrieved from Uniprot.
+
+Prior processing of datasets (according to the study):
 
 * Proteomics: Global proteomics data, median polishing and log2 transformed, no missing value filtering
 * RNA-seq: Linear gene expression RSEM, upper quantile normalized and log2(+1) transformed
@@ -166,7 +169,7 @@ ggarrange(
 
 * Untransform log-transformed values (and minus-shift one)
 * Filter low counts-per-million reads
-* Calculate Voom for the now approximate
+* Calculate Voom
 
 ```{r}
 unlog <- function(mat) {
@@ -205,12 +208,10 @@ moo_rna_stat_adf <- topTable(efit, adjust="BH", coef="Genomics_subtypecnv_high -
 moo_rna_stat_adf %>% filter(cnvhigh_cnvlow.adj.P.Val < 0.05 & abs(cnvhigh_cnvlow.logFC) > 1)
 
 moo_rna_stat_adf %>% ggplot(aes(x=cnvhigh_cnvlow.P.Value)) + geom_histogram(bins=100)
-
-# moo_rna_stat_adf <- moo_rna_stat_adf %>% `colnames<-`(paste0("cnvhigh_cnvlow.", colnames(moo_rna_stat_adf)))
 moo$rdf_rna_w_stats <- cbind(idx=moo$rdf_rna$idx[features_passing_cpm], moo_rna_stat_adf, moo$rdf_rna[features_passing_cpm, ] %>% dplyr::select(moo$ddf$idx))
 ```
 
-### Spotcheck regulated feature
+### Spotcheck differentially expressed features
 
 ```{r}
 moo$rdf_rna %>% 
@@ -269,6 +270,10 @@ write_tsv(moo$ddf %>% dplyr::select(idx, Genomics_subtype, everything()), path=s
 ```
 
 # Covid dataset: Proteomics
+
+Based on the study "Proteomics of SARS-CoV-2-infected host cells reveals therapy targets" (doi: https://doi.org/10.1038/s41586-020-2332-7)
+
+The data is retrieved from its supplementary, and converted into TSV format. The databases are retrieved from Uniprot.
 
 ## Load data
 
@@ -421,15 +426,10 @@ write_tsv(coo$ddf, path=sprintf("%s/design_prot.tsv", coo_basedir))
 
 # Covid dataset: RNA-seq
 
+Based on article SARS-CoV-2 productively infects human gut enterocytes (Mart M Lamers, Science, 2020, doi: 10.1126/science.abc1669)
+The data is based on supplementary materials retrieved from: https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE149312
 
-(Previously)
-Based on article: SARS-CoV-2 productively infects human gut enterocytes (Mart M Lamers, Science, 2020)
-Supplementary materials retrieved from:
-https://science.sciencemag.org/content/suppl/2020/04/30/science.abc1669.DC1
-
-(Now)
-Based on supplementary retrieved from: https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE149312
-From info: `Supplementary_files_format_and_content: The data are in csv format. The table contains UMI deduplicated counts normalized between samples.`
+According to the description, the data contains UMI deduplicated counts normalized between samples.
 
 * UMI (unique molecular identifier) count: Absolute number of observed transcripts, alternative to read counting? Negative binomial good fit?
 
@@ -523,6 +523,8 @@ exp_med_60h_sadf <- do_limma_contrast(
 ```
 ## Load existing Limma comparisons (60h)
 
+For reference, the Limma results provided together with the supplementary materials is also included.
+
 ```{r}
 parse_for_omicloupe <- function(raw_df, prefix) {
   raw_df %>% 
@@ -553,10 +555,6 @@ sc2_result_rdf <- cbind(
   sarscov2_rna_diff_organoids_df %>% dplyr::select(-one_of("idx", "chr", "full_gene")),
   sc2_vwts$E %>% replace_na(0)
 )
-
-sc2_result_rdf %>% ggplot(aes(x=exp_med_60h.logFC, y=exp_med_60h_precalc.log2FoldChange)) + geom_point() + ggtitle("RNA-seq 60h, my analysis vs theirs")
-sc2_result_rdf %>% ggplot(aes(x=exp_med_60h.logFC, y=exp_med_24h.logFC)) + geom_point() + ggtitle("RNA-seq 60h vs 24h folds (my analysis)")
-sc2_result_rdf %>% ggplot(aes(x=exp_med_60h.logFC-exp_med_60h_precalc.log2FoldChange)) + geom_histogram(bins=100)
 ```
 
 ## Output
@@ -567,6 +565,10 @@ write_tsv(sarscov2_ddf, path = sprintf("%s/design_rna.tsv", coo_basedir))
 ```
 
 # LFQ benchmark dataset
+
+Based on the study "A multicenter study benchmarks software tools for label-free proteome quantification" (doi: doi:10.1038/nbt.3685)
+
+The data is accessed from its ProteomeXchange repository (ID: PXD002952, url: http://proteomecentral.proteomexchange.org/cgi/GetDataset?ID=PXD002952)
 
 ## LFQ util functions
 
@@ -817,9 +819,6 @@ map(
   ggpubr::ggarrange(plotlist = ., nrow=3, ncol=2) %>% 
   ggpubr::annotate_figure(top="Protein data")
 ```
-
-
-
 
 ### Perform statistical comparisons
 
