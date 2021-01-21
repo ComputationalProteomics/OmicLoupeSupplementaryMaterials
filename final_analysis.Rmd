@@ -133,7 +133,9 @@ moo$rdf_rna <- read_tsv(mo_rna_fp, na="0")
 moo_joint_colnames <- intersect(colnames(moo$rdf_prot), colnames(moo$rdf_rna))
 
 moo$ddf_raw <- read_tsv(mo_ddf_fp) %>% 
-    filter(idx %in% moo_joint_colnames)
+    filter(idx %in% moo_joint_colnames) %>%
+    tidyr::replace_na(list(Genomics_subtype="Normal"))
+
 moo$ddf <- moo$ddf_raw %>% 
     dplyr::filter(Case_excluded == "No") %>% 
     dplyr::filter(Proteomics_Tumor_Normal != "Adjacent_normal") %>%
@@ -208,7 +210,17 @@ moo_rna_stat_adf <- topTable(efit, adjust="BH", coef="Genomics_subtypecnv_high -
 moo_rna_stat_adf %>% filter(cnvhigh_cnvlow.adj.P.Val < 0.05 & abs(cnvhigh_cnvlow.logFC) > 1)
 
 moo_rna_stat_adf %>% ggplot(aes(x=cnvhigh_cnvlow.P.Value)) + geom_histogram(bins=100)
-moo$rdf_rna_w_stats <- cbind(idx=moo$rdf_rna$idx[features_passing_cpm], moo_rna_stat_adf, moo$rdf_rna[features_passing_cpm, ] %>% dplyr::select(moo$ddf$idx))
+moo$rdf_rna_w_stats <- cbind(
+    idx=moo$rdf_rna$idx[features_passing_cpm], 
+    moo_rna_stat_adf, 
+    moo$rdf_rna[features_passing_cpm, ] %>% dplyr::select(moo$ddf$idx)
+)
+
+moo$rdf_rna_voom_w_stats <- cbind(
+    idx=moo$rdf_rna$idx[features_passing_cpm],
+    moo_rna_stat_adf,
+    vwts$E %>% data.frame() %>% dplyr::select(moo$ddf$idx)
+)
 ```
 
 ### Spotcheck differentially expressed features
@@ -264,6 +276,7 @@ write_tsv(moo$prot_rdf_stat %>% head(500), path=sprintf("%s/prot_stats_500.tsv",
 write_tsv(moo$rdf_rna, path=sprintf("%s/rna_full.tsv", moo_out_base))
 write_tsv(moo$rdf_rna_w_stats, path=sprintf("%s/rna_stats.tsv", moo_out_base))
 write_tsv(moo$rdf_rna_w_stats %>% head(500), path=sprintf("%s/rna_stats_500.tsv", moo_out_base))
+write_tsv(moo$rdf_rna_voom_w_stats, path=sprintf("%s/rna_stats_voom.tsv", moo_out_base))
 
 write_tsv(moo$ddf_raw %>% dplyr::select(idx, Genomics_subtype, everything()), path=sprintf("%s/design_full.tsv", moo_out_base))
 write_tsv(moo$ddf %>% dplyr::select(idx, Genomics_subtype, everything()), path=sprintf("%s/design_stats.tsv", moo_out_base))
@@ -637,7 +650,8 @@ sample_names <- c(
   "lgillet_i160308_002", "lgillet_i160308_004", "lgillet_i160308_011"
 )
 
-ddf <- data.frame(sample=sample_names, group=c(rep("A", 3), rep("B", 3)), stringsAsFactors = FALSE)
+ddf <- data.frame(sample=sample_names, group=c(rep("A", 3), rep("B", 3)), stringsAsFactors = FALSE) %>%
+    mutate(level=paste0("Sp", group))
 ddf
 ```
 
@@ -915,6 +929,15 @@ walk(names(lfq_objs), ~write_tsv(lfq_objs[[.]]$prot_stat_rdf, path = sprintf("%s
 write_tsv(joint_rdf_table, path=sprintf("%s/joint_data_reduced.tsv", lfq_base_out))
 write_tsv(joint_rdf_table_all, path=sprintf("%s/joint_data_full.tsv", lfq_base_out))
 write_tsv(joint_ddf, path=sprintf("%s/joint_design.tsv", lfq_base_out))
+
+walk(
+    names(lfq_objs), 
+    ~print(sprintf(
+        "Dataset: %s Features: %s", 
+        ., 
+        lfq_objs[[.]]$prot_rdf %>% nrow()
+    ))
+)
 ```
 
 # Session info
